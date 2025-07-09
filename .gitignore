@@ -1,0 +1,3 @@
+ckpt/bbox_gen.ckpt
+ckpt/partfield_encoder.ckpt
+ckpt/sam_vit_h_4b8939.pth
