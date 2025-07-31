@@ -1,34 +1,38 @@
-# __init__.py
-
+# Import all the node classes from their respective files
 from .omni_nodes import (
     OmniPartLoaderNode,
-    OmniPartSegmenterNode,
-    OmniPartMergeNode,
+    OmniPartSegmentImage,
+    OmniPartCombineSegments,
+    OmniPartHideSegments,
     OmniPartGenerate3DDataNode,
-    OmniPartSaveMeshNode
+    OmniPartSaveMeshNode,
+    OmniPartExportObjects,
 )
 
-# Import the new debug node
-from .omni_texture import OmniPartTextureMeshNode
+from .omni_texture import OmniPartSaveTexturedMesh
 
+# Map the internal class names to the names ComfyUI will use
 NODE_CLASS_MAPPINGS = {
     "OmniPartLoader": OmniPartLoaderNode,
-    "OmniPartSegmenter": OmniPartSegmenterNode,
-    "OmniPartMergeSegments": OmniPartMergeNode,
+    "OmniPartSegmentImage": OmniPartSegmentImage,
+    "OmniPartCombineSegments": OmniPartCombineSegments,
+    "OmniPartHideSegments": OmniPartHideSegments,
     "OmniPartGenerate3DData": OmniPartGenerate3DDataNode,
     "OmniPartSaveMesh": OmniPartSaveMeshNode,
-    "OmniPartTextureMesh (Debug)": OmniPartTextureMeshNode, # Add the new node
+    "OmniPartSaveTexturedMesh": OmniPartSaveTexturedMesh,
+    "OmniPartExportObjects": OmniPartExportObjects,
 }
 
+# Map the internal class names to the names that will be displayed in the menu
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniPartLoader": "Load OmniPart Models",
-    "OmniPartSegmenter": "Segment Image (OmniPart)",
-    "OmniPartMergeSegments": "Merge Segments (OmniPart)",
-    "OmniPartGenerate3DData": "Generate 3D Data (OmniPart)",
-    "OmniPartSaveMesh": "Save Mesh (OmniPart)",
-    "OmniPartTextureMesh (Debug)": "Texture Mesh (Debug)", # Add its display name
+    "OmniPartSegmentImage": "Segment Image",
+    "OmniPartCombineSegments": "Combine Segments",
+    "OmniPartHideSegments": "Hide Segments",
+    "OmniPartGenerate3DData": "Generate 3D Data",
+    "OmniPartSaveMesh": "Save Untextured Mesh",
+    "OmniPartSaveTexturedMesh": "Save Textured Mesh",
+    "OmniPartExportObjects": "Export Objects from Image",
 }
 
-WEB_DIRECTORY = "./js"
-
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

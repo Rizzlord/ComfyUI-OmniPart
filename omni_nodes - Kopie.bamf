@@ -127,13 +127,10 @@ def visualize_mask(image_np, group_ids, visualize=True):
         cv2.putText(vis_np, text, text_origin, font_face, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
     return Image.fromarray(vis_np)
 
-def resize_and_fit(pil_image, max_size):
-    """Resizes a PIL image to fit within a max_size square, preserving aspect ratio."""
-    if pil_image.width == 0 or pil_image.height == 0:
-        return pil_image
-    ratio = min(max_size / pil_image.width, max_size / pil_image.height)
-    new_size = (int(pil_image.width * ratio), int(pil_image.height * ratio))
-    return pil_image.resize(new_size, Image.Resampling.LANCZOS)
+def resize_pil_image(pil_img, target_size):
+    if target_size > 0:
+        return pil_img.resize((target_size, target_size), Image.Resampling.LANCZOS)
+    return pil_img
 
 def draw_gradient_circle(image_array, center_x, center_y, radius, color_center, color_edge):
     """Draws a circle with a radial gradient on a NumPy array."""
@@ -234,8 +231,7 @@ class OmniPartSegmentImage:
         if enable_upscale:
             seg_img_pil = upscale_pil_image(seg_img_pil, upscale_model)
         resolution_int = 0 if output_resolution == 'original' else int(output_resolution)
-        if resolution_int > 0:
-             seg_img_pil = seg_img_pil.resize((resolution_int, resolution_int), Image.Resampling.LANCZOS)
+        seg_img_pil = resize_pil_image(seg_img_pil, resolution_int)
         omni_state = {
             "image_np": image_np, "processed_image_path": rgba_path, "group_ids": group_ids,
             "original_group_ids": np.copy(group_ids), "img_name": img_name, "output_dir": output_dir,
@@ -288,8 +284,7 @@ class OmniPartCombineSegments:
         if enable_upscale:
             merged_img_pil = upscale_pil_image(merged_img_pil, upscale_model)
         resolution_int = 0 if output_resolution == 'original' else int(output_resolution)
-        if resolution_int > 0:
-            merged_img_pil = merged_img_pil.resize((resolution_int, resolution_int), Image.Resampling.LANCZOS)
+        merged_img_pil = resize_pil_image(merged_img_pil, resolution_int)
         omni_state["group_ids"] = new_group_ids
         cleanup_memory(MODELS.sam_mask_generator)
         return (pil_to_tensor(merged_img_pil), omni_state)
@@ -302,7 +297,7 @@ class OmniPartHideSegments:
                 "omni_state": ("OMNIPART_STATE",),
                 "hide_string": ("STRING", {"multiline": False, "default": "", "placeholder": "Segments to hide, e.g., 1,2"}),
                 "visualize": ("BOOLEAN", {"default": True}),
-                "output_resolution": (['original', '512', '1024', '2048', '4096', '8192'],),
+                "output_resolution": (['original', '512', '1024', '2048', '4096'],),
             },
             "optional": {
                 "enable_upscale": ("BOOLEAN", {"default": False}),
@@ -353,9 +348,8 @@ class OmniPartHideSegments:
             mask_visualization_pil = upscale_pil_image(mask_visualization_pil, upscale_model)
             image_with_hidden_parts_pil = upscale_pil_image(image_with_hidden_parts_pil, upscale_model)
         resolution_int = 0 if output_resolution == 'original' else int(output_resolution)
-        if resolution_int > 0:
-            mask_visualization_pil = mask_visualization_pil.resize((resolution_int, resolution_int), Image.Resampling.LANCZOS)
-            image_with_hidden_parts_pil = image_with_hidden_parts_pil.resize((resolution_int, resolution_int), Image.Resampling.LANCZOS)
+        mask_visualization_pil = resize_pil_image(mask_visualization_pil, resolution_int)
+        image_with_hidden_parts_pil = resize_pil_image(image_with_hidden_parts_pil, resolution_int)
         omni_state["group_ids"] = group_ids
         return (pil_to_tensor(mask_visualization_pil), pil_to_tensor(image_with_hidden_parts_pil), omni_state)
 
@@ -365,22 +359,20 @@ class OmniPartExportObjects:
         return {
             "required": {
                 "omni_state": ("OMNIPART_STATE",),
-                "upscale_model": ("UPSCALE_MODEL",),
                 "output_directory": ("STRING", {"default": "OmniPart_Objects"}),
                 "filename_prefix": ("STRING", {"default": "object"}),
-                "canvas_background": (['white', 'black', 'alpha'],),
-                "output_resolution": (['512', '1024', '2048', '4096', '8192'],),
             },
             "optional": {
-                "padding": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1}),
+                "enable_upscale": ("BOOLEAN", {"default": False}),
+                "upscale_model": ("UPSCALE_MODEL",),
             }
         }
-    RETURN_TYPES = ("IMAGE", "INT", "STRING")
-    RETURN_NAMES = ("IMAGE_BATCH", "object_count", "output_path")
+    RETURN_TYPES = ("INT", "STRING")
+    RETURN_NAMES = ("object_count", "output_path")
     FUNCTION = "export_objects"
     CATEGORY = "OmniPart"
 
-    def export_objects(self, omni_state, upscale_model, output_directory, filename_prefix, canvas_background, output_resolution, padding=5):
+    def export_objects(self, omni_state, output_directory, filename_prefix, enable_upscale=False, upscale_model=None):
         group_ids = omni_state["group_ids"]
         source_image_path = omni_state["processed_image_path"]
 
@@ -392,84 +384,30 @@ class OmniPartExportObjects:
 
         object_ids = [uid for uid in np.unique(group_ids) if uid >= 0]
         
-        image_batch_list = []
         count = 0
-        
         for obj_id in object_ids:
             mask = (group_ids == obj_id)
             
-            # 1. Isolate the original object
+            # Create a new transparent canvas and copy only the object's pixels
             object_canvas_np = np.zeros_like(source_rgba_np)
             object_canvas_np[mask] = source_rgba_np[mask]
             
-            isolated_object_pil = Image.fromarray(object_canvas_np)
+            object_pil = Image.fromarray(object_canvas_np)
             
-            # 2. Get bounding box and add padding
-            bbox = isolated_object_pil.getbbox()
-            if not bbox:
-                continue
+            # Crop to the object's bounding box
+            bbox = object_pil.getbbox()
+            if bbox:
+                object_pil = object_pil.crop(bbox)
             
-            # Expand the bounding box with padding, clamped to the image dimensions
-            img_width, img_height = isolated_object_pil.size
-            left = max(0, bbox[0] - padding)
-            upper = max(0, bbox[1] - padding)
-            right = min(img_width, bbox[2] + padding)
-            lower = min(img_height, bbox[3] + padding)
-
-            # 3. Crop the object with the new padded bounding box
-            cropped_object_pil = isolated_object_pil.crop((left, upper, right, lower))
+            if enable_upscale:
+                object_pil = upscale_pil_image(object_pil, upscale_model)
             
-            # 4. Mandatory upscale of the cropped object to preserve detail
-            upscaled_object_pil = cropped_object_pil
-            if callable(upscale_model):
-                rgb_part = cropped_object_pil.convert("RGB")
-                alpha_part = cropped_object_pil.split()[3]
-                
-                upscaled_rgb_pil = upscale_pil_image(rgb_part, upscale_model)
-                
-                upscaled_alpha_pil = alpha_part.resize(upscaled_rgb_pil.size, Image.Resampling.LANCZOS)
-                
-                upscaled_rgb_pil.putalpha(upscaled_alpha_pil)
-                upscaled_object_pil = upscaled_rgb_pil
-            
-            # 5. Resize the high-resolution object to fit into a 512x512 space
-            fitted_object_pil = resize_and_fit(upscaled_object_pil, 512)
-
-            # 6. Create the 512x512 base canvas with the selected background
-            if canvas_background == 'white':
-                bg_color = (255, 255, 255, 255)
-            elif canvas_background == 'black':
-                bg_color = (0, 0, 0, 255)
-            else: # 'alpha'
-                bg_color = (0, 0, 0, 0)
-            
-            base_canvas_pil = Image.new('RGBA', (512, 512), bg_color)
-            paste_x = (512 - fitted_object_pil.width) // 2
-            paste_y = (512 - fitted_object_pil.height) // 2
-            base_canvas_pil.paste(fitted_object_pil, (paste_x, paste_y), fitted_object_pil)
-
-            # 7. Resize to the final target resolution
-            final_image_pil = base_canvas_pil
-            target_res_int = int(output_resolution)
-            if final_image_pil.size != (target_res_int, target_res_int):
-                final_image_pil = final_image_pil.resize((target_res_int, target_res_int), Image.Resampling.LANCZOS)
-
-            # 8. Save the final image and add it to the batch
             save_path = os.path.join(full_output_path, f"{filename_prefix}_{obj_id}.png")
-            final_image_pil.save(save_path)
-            
-            image_batch_list.append(pil_to_tensor(final_image_pil.convert("RGB")))
+            object_pil.save(save_path)
             count += 1
             
-        if not image_batch_list:
-            print("Export Objects: No objects found to export.")
-            fallback_tensor = torch.zeros((1, 64, 64, 3))
-            return (fallback_tensor, 0, full_output_path)
-
-        final_batch = torch.cat(image_batch_list, dim=0)
-            
         print(f"Exported {count} objects to {full_output_path}")
-        return (final_batch, count, full_output_path)
+        return (count, full_output_path)
 
 class OmniPartGenerate3DDataNode:
     @classmethod
@@ -565,7 +503,7 @@ NODE_CLASS_MAPPINGS = {
     "OmniPartSegmentImage": OmniPartSegmentImage,
     "OmniPartCombineSegments": OmniPartCombineSegments,
     "OmniPartHideSegments": OmniPartHideSegments,
-    "OmniPartExportObjects": OmniPartExportObjects,
+    "OmniPartExportObjects": OmniPartExportObjects, # Added new node
     "OmniPartGenerate3DData": OmniPartGenerate3DDataNode,
     "OmniPartSaveMesh": OmniPartSaveMeshNode,
 }
@@ -575,7 +513,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniPartSegmentImage": "Segment Image",
     "OmniPartCombineSegments": "Combine Segments",
     "OmniPartHideSegments": "Hide Segments",
-    "OmniPartExportObjects": "Export Objects from Image",
+    "OmniPartExportObjects": "Export Objects from Image", # Added new node
     "OmniPartGenerate3DData": "Generate 3D Data",
     "OmniPartSaveMesh": "Save Untextured Mesh",
 }
