@@ -25,7 +25,7 @@ Go into the ComfyUI/custom_nodes/ folder.
 
 Clone this repository:
 
-git clone [<your_repository_url_here>](https://github.com/Rizzlord/ComfyUI-OmniPart)
+git clone https://github.com/Rizzlord/ComfyUI-OmniPart
 
 Start or restart ComfyUI. The first time you run a workflow, the necessary models (SAM, OmniPart, etc.) will be downloaded automatically from Hugging Face. This may take some time.
 
