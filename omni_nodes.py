@@ -2,7 +2,7 @@ import os
 import sys
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import gc
 from omegaconf import OmegaConf
 from huggingface_hub import hf_hub_download
@@ -50,14 +50,12 @@ MODELS = OmniPartModels()
 # --- Helper Functions ---
 
 def tensor_to_pil(tensor):
-    """Converts a ComfyUI IMAGE tensor (B, H, W, C) to a PIL image."""
     if tensor.ndim == 4:
         tensor = tensor.squeeze(0)
     image_np = tensor.mul(255).clamp(0, 255).byte().cpu().numpy()
     return Image.fromarray(image_np)
 
 def pil_to_tensor(image):
-    """Converts a PIL image (H, W, C) to a ComfyUI IMAGE tensor (1, H, W, C)."""
     image_np = np.array(image).astype(np.float32) / 255.0
     tensor = torch.from_numpy(image_np)
     if tensor.ndim == 3:
@@ -65,7 +63,6 @@ def pil_to_tensor(image):
     return tensor
 
 def cleanup_memory(*models_to_unload):
-    """Unloads models and clears CUDA cache using ComfyUI's manager."""
     for model in models_to_unload:
         if model is not None:
             if hasattr(model, 'predictor') and hasattr(model.predictor, 'model'):
@@ -77,7 +74,6 @@ def cleanup_memory(*models_to_unload):
         mm.soft_empty_cache()
 
 def upscale_pil_image(pil_image, upscale_model):
-    """Upscales a PIL image using a provided upscale model."""
     if not pil_image or not callable(upscale_model):
         return pil_image
     print("Upscaling image with provided model...")
@@ -128,7 +124,6 @@ def visualize_mask(image_np, group_ids, visualize=True):
     return Image.fromarray(vis_np)
 
 def resize_and_fit(pil_image, max_size):
-    """Resizes a PIL image to fit within a max_size square, preserving aspect ratio."""
     if pil_image.width == 0 or pil_image.height == 0:
         return pil_image
     ratio = min(max_size / pil_image.width, max_size / pil_image.height)
@@ -136,7 +131,6 @@ def resize_and_fit(pil_image, max_size):
     return pil_image.resize(new_size, Image.Resampling.LANCZOS)
 
 def draw_gradient_circle(image_array, center_x, center_y, radius, color_center, color_edge):
-    """Draws a circle with a radial gradient on a NumPy array."""
     x_min, x_max = max(0, center_x - radius), min(image_array.shape[1], center_x + radius)
     y_min, y_max = max(0, center_y - radius), min(image_array.shape[0], center_y + radius)
     for y in range(y_min, y_max):
@@ -150,6 +144,28 @@ def draw_gradient_circle(image_array, center_x, center_y, radius, color_center, 
                 ]
                 image_array[y, x] = [new_color[0], new_color[1], new_color[2], 255]
     return image_array
+
+def create_texture_bleed_image(image_pil, radius=5):
+    if radius <= 0:
+        return image_pil
+    image_np = np.array(image_pil)
+    image_bgra = cv2.cvtColor(image_np, cv2.COLOR_RGBA2BGRA)
+    alpha_channel = image_bgra[:, :, 3]
+    transparent_mask = (alpha_channel == 0).astype(np.uint8)
+    image_bgr = image_bgra[:, :, :3]
+    inpainted_bgr = cv2.inpaint(image_bgr, transparent_mask, radius, cv2.INPAINT_TELEA)
+    final_bgra = np.dstack((inpainted_bgr, alpha_channel))
+    final_rgba = cv2.cvtColor(final_bgra, cv2.COLOR_BGRA2RGBA)
+    return Image.fromarray(final_rgba)
+
+def smooth_edges(pil_image, radius):
+    if radius <= 0 or pil_image.mode != 'RGBA':
+        return pil_image
+    alpha = pil_image.split()[3]
+    blurred_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=radius))
+    new_image = pil_image.copy()
+    new_image.putalpha(blurred_alpha)
+    return new_image
 
 # --- Node Definitions ---
 
@@ -201,19 +217,21 @@ class OmniPartSegmentImage:
                 "loader": ("BOOLEAN", {"forceInput": True}),
                 "image": ("IMAGE",),
                 "size_threshold": ("INT", {"default": 1800, "min": 100, "max": 8000, "step": 100}),
+                "texture_bleed_radius": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
                 "visualize": ("BOOLEAN", {"default": True}),
                 "output_resolution": (['original', '512', '1024', '2048', '4096'],),
             },
             "optional": {
                 "enable_upscale": ("BOOLEAN", {"default": False}),
                 "upscale_model": ("UPSCALE_MODEL",),
+                "edge_smoothing": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             }
         }
     RETURN_TYPES = ("IMAGE", "OMNIPART_STATE")
     FUNCTION = "segment_image"
     CATEGORY = "OmniPart"
 
-    def segment_image(self, loader, image, size_threshold, visualize, output_resolution, enable_upscale=False, upscale_model=None):
+    def segment_image(self, loader, image, size_threshold, texture_bleed_radius, visualize, output_resolution, enable_upscale=False, upscale_model=None, edge_smoothing=1.0):
         if not all([MODELS.sam_mask_generator, MODELS.rmbg_model]):
             raise Exception("Models not loaded. Please use the OmniPartLoader node first.")
         MODELS.sam_mask_generator.predictor.model.to(DEVICE)
@@ -223,13 +241,18 @@ class OmniPartSegmentImage:
         img_name = f"omni_input_{np.random.randint(100000)}"
         processed_image = prepare_image(pil_image, rmbg_net=MODELS.rmbg_model)
         processed_image = resize_and_pad_to_square(processed_image)
-        white_bg = Image.new("RGBA", processed_image.size, (255, 255, 255, 255))
-        white_bg_img = Image.alpha_composite(white_bg, processed_image.convert("RGBA"))
+        
+        processed_image = smooth_edges(processed_image, edge_smoothing)
+        
+        texture_ready_image = create_texture_bleed_image(processed_image, texture_bleed_radius)
+        
+        white_bg = Image.new("RGBA", texture_ready_image.size, (255, 255, 255, 255))
+        white_bg_img = Image.alpha_composite(white_bg, texture_ready_image.convert("RGBA"))
         image_np = np.array(white_bg_img.convert('RGB'))
         rgba_path = os.path.join(output_dir, f"{img_name}_processed.png")
-        processed_image.save(rgba_path)
+        texture_ready_image.save(rgba_path)
         visual = Visualizer(image_np)
-        group_ids, _ = get_sam_mask(image_np, MODELS.sam_mask_generator, visual, None, rgba_image=processed_image, img_name=img_name, save_dir=output_dir, size_threshold=size_threshold)
+        group_ids, _ = get_sam_mask(image_np, MODELS.sam_mask_generator, visual, None, rgba_image=texture_ready_image, img_name=img_name, save_dir=output_dir, size_threshold=size_threshold)
         seg_img_pil = visualize_mask(image_np, group_ids, visualize)
         if enable_upscale:
             seg_img_pil = upscale_pil_image(seg_img_pil, upscale_model)
@@ -302,7 +325,7 @@ class OmniPartHideSegments:
                 "omni_state": ("OMNIPART_STATE",),
                 "hide_string": ("STRING", {"multiline": False, "default": "", "placeholder": "Segments to hide, e.g., 1,2"}),
                 "visualize": ("BOOLEAN", {"default": True}),
-                "output_resolution": (['original', '512', '1024', '2048', '4096', '8192'],),
+                "output_resolution": (['original', '512', '1024', '2048', '4096'],),
             },
             "optional": {
                 "enable_upscale": ("BOOLEAN", {"default": False}),
@@ -369,10 +392,11 @@ class OmniPartExportObjects:
                 "output_directory": ("STRING", {"default": "OmniPart_Objects"}),
                 "filename_prefix": ("STRING", {"default": "object"}),
                 "canvas_background": (['white', 'black', 'alpha'],),
-                "output_resolution": (['512', '1024', '2048', '4096', '8192'],),
+                "output_resolution": (['512', '1024', '2048', '4096'],),
             },
             "optional": {
                 "padding": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1}),
+                "edge_smoothing": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             }
         }
     RETURN_TYPES = ("IMAGE", "INT", "STRING")
@@ -380,94 +404,66 @@ class OmniPartExportObjects:
     FUNCTION = "export_objects"
     CATEGORY = "OmniPart"
 
-    def export_objects(self, omni_state, upscale_model, output_directory, filename_prefix, canvas_background, output_resolution, padding=5):
+    def export_objects(self, omni_state, upscale_model, output_directory, filename_prefix, canvas_background, output_resolution, padding=5, edge_smoothing=1.0):
         group_ids = omni_state["group_ids"]
         source_image_path = omni_state["processed_image_path"]
-
         full_output_path = os.path.join(folder_paths.get_output_directory(), output_directory)
         os.makedirs(full_output_path, exist_ok=True)
-
         source_rgba_pil = Image.open(source_image_path).convert("RGBA")
         source_rgba_np = np.array(source_rgba_pil)
-
         object_ids = [uid for uid in np.unique(group_ids) if uid >= 0]
-        
         image_batch_list = []
         count = 0
-        
         for obj_id in object_ids:
             mask = (group_ids == obj_id)
-            
-            # 1. Isolate the original object
             object_canvas_np = np.zeros_like(source_rgba_np)
             object_canvas_np[mask] = source_rgba_np[mask]
-            
             isolated_object_pil = Image.fromarray(object_canvas_np)
-            
-            # 2. Get bounding box and add padding
             bbox = isolated_object_pil.getbbox()
             if not bbox:
                 continue
-            
-            # Expand the bounding box with padding, clamped to the image dimensions
             img_width, img_height = isolated_object_pil.size
             left = max(0, bbox[0] - padding)
             upper = max(0, bbox[1] - padding)
             right = min(img_width, bbox[2] + padding)
             lower = min(img_height, bbox[3] + padding)
-
-            # 3. Crop the object with the new padded bounding box
             cropped_object_pil = isolated_object_pil.crop((left, upper, right, lower))
             
-            # 4. Mandatory upscale of the cropped object to preserve detail
-            upscaled_object_pil = cropped_object_pil
+            smoothed_object_pil = smooth_edges(cropped_object_pil, edge_smoothing)
+
+            upscaled_object_pil = smoothed_object_pil
             if callable(upscale_model):
-                rgb_part = cropped_object_pil.convert("RGB")
-                alpha_part = cropped_object_pil.split()[3]
-                
+                rgb_part = smoothed_object_pil.convert("RGB")
+                alpha_part = smoothed_object_pil.split()[3]
                 upscaled_rgb_pil = upscale_pil_image(rgb_part, upscale_model)
-                
                 upscaled_alpha_pil = alpha_part.resize(upscaled_rgb_pil.size, Image.Resampling.LANCZOS)
-                
                 upscaled_rgb_pil.putalpha(upscaled_alpha_pil)
                 upscaled_object_pil = upscaled_rgb_pil
             
-            # 5. Resize the high-resolution object to fit into a 512x512 space
             fitted_object_pil = resize_and_fit(upscaled_object_pil, 512)
-
-            # 6. Create the 512x512 base canvas with the selected background
             if canvas_background == 'white':
                 bg_color = (255, 255, 255, 255)
             elif canvas_background == 'black':
                 bg_color = (0, 0, 0, 255)
-            else: # 'alpha'
+            else:
                 bg_color = (0, 0, 0, 0)
-            
             base_canvas_pil = Image.new('RGBA', (512, 512), bg_color)
             paste_x = (512 - fitted_object_pil.width) // 2
             paste_y = (512 - fitted_object_pil.height) // 2
             base_canvas_pil.paste(fitted_object_pil, (paste_x, paste_y), fitted_object_pil)
-
-            # 7. Resize to the final target resolution
             final_image_pil = base_canvas_pil
             target_res_int = int(output_resolution)
             if final_image_pil.size != (target_res_int, target_res_int):
                 final_image_pil = final_image_pil.resize((target_res_int, target_res_int), Image.Resampling.LANCZOS)
-
-            # 8. Save the final image and add it to the batch
             save_path = os.path.join(full_output_path, f"{filename_prefix}_{obj_id}.png")
             final_image_pil.save(save_path)
-            
             image_batch_list.append(pil_to_tensor(final_image_pil.convert("RGB")))
             count += 1
-            
         if not image_batch_list:
             print("Export Objects: No objects found to export.")
             fallback_tensor = torch.zeros((1, 64, 64, 3))
             return (fallback_tensor, 0, full_output_path)
-
         final_batch = torch.cat(image_batch_list, dim=0)
-            
         print(f"Exported {count} objects to {full_output_path}")
         return (final_batch, count, full_output_path)
 
