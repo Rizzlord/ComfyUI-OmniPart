@@ -172,15 +172,22 @@ def smooth_edges(pil_image, radius):
 class OmniPartLoaderNode:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"force_reload": ("BOOLEAN", {"default": False})}}
+        return {
+            "required": {
+                "force_reload": ("BOOLEAN", {"default": False}),
+                "load_texture_pipeline_only": ("BOOLEAN", {"default": False, "tooltip": "Only load the texture pipeline, skip 3D generation models (useful when using TripoSG)"})
+            }
+        }
     RETURN_TYPES = ("BOOLEAN",)
     RETURN_NAMES = ("loaded",)
     FUNCTION = "load_models"
     CATEGORY = "OmniPart"
 
-    def load_models(self, force_reload):
+    def load_models(self, force_reload, load_texture_pipeline_only=False):
         ckpt_dir = os.path.join(current_dir, "ckpt")
         os.makedirs(ckpt_dir, exist_ok=True)
+        
+        # Always load SAM and RMBG models (needed for segmentation)
         if MODELS.sam_mask_generator is None or force_reload:
             print("Loading SAM model...")
             sam_ckpt_path = hf_hub_download("omnipart/OmniPart_modules", "sam_vit_h_4b8939.pth", local_dir=ckpt_dir)
@@ -191,22 +198,35 @@ class OmniPartLoaderNode:
             print("Loading BriaRMBG 2.0 model...")
             MODELS.rmbg_model = AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-2.0', trust_remote_code=True)
             cleanup_memory(MODELS.rmbg_model)
-        if MODELS.part_synthesis_pipeline is None or force_reload:
-            print("Loading PartSynthesis model...")
-            MODELS.part_synthesis_pipeline = OmniPartImageTo3DPipeline.from_pretrained('omnipart/OmniPart')
-            cleanup_memory(MODELS.part_synthesis_pipeline)
-        if MODELS.bbox_gen_model is None or force_reload:
-            print("Loading BboxGen model...")
-            partfield_ckpt_path = hf_hub_download("omnipart/OmniPart_modules", "partfield_encoder.ckpt", local_dir=ckpt_dir)
-            bbox_gen_ckpt_path = hf_hub_download("omnipart/OmniPart_modules", "bbox_gen.ckpt", local_dir=ckpt_dir)
-            config_path = os.path.join(current_dir, "configs", "bbox_gen.yaml")
-            bbox_gen_config = OmegaConf.load(config_path).model.args
-            bbox_gen_config.partfield_encoder_path = partfield_ckpt_path
-            MODELS.bbox_gen_model = BboxGen(bbox_gen_config)
-            MODELS.bbox_gen_model.load_state_dict(torch.load(bbox_gen_ckpt_path), strict=False)
-            MODELS.bbox_gen_model.eval().half()
-            cleanup_memory(MODELS.bbox_gen_model)
-        print("All OmniPart models loaded successfully.")
+        
+        # Load texture pipeline if requested or if not loading only texture pipeline
+        if not load_texture_pipeline_only or force_reload:
+            if MODELS.part_synthesis_pipeline is None or force_reload:
+                print("Loading PartSynthesis model...")
+                MODELS.part_synthesis_pipeline = OmniPartImageTo3DPipeline.from_pretrained('omnipart/OmniPart')
+                cleanup_memory(MODELS.part_synthesis_pipeline)
+            if MODELS.bbox_gen_model is None or force_reload:
+                print("Loading BboxGen model...")
+                partfield_ckpt_path = hf_hub_download("omnipart/OmniPart_modules", "partfield_encoder.ckpt", local_dir=ckpt_dir)
+                bbox_gen_ckpt_path = hf_hub_download("omnipart/OmniPart_modules", "bbox_gen.ckpt", local_dir=ckpt_dir)
+                config_path = os.path.join(current_dir, "configs", "bbox_gen.yaml")
+                bbox_gen_config = OmegaConf.load(config_path).model.args
+                bbox_gen_config.partfield_encoder_path = partfield_ckpt_path
+                MODELS.bbox_gen_model = BboxGen(bbox_gen_config)
+                MODELS.bbox_gen_model.load_state_dict(torch.load(bbox_gen_ckpt_path), strict=False)
+                MODELS.bbox_gen_model.eval().half()
+                cleanup_memory(MODELS.bbox_gen_model)
+        else:
+            # Unload 3D generation models if only texture pipeline is needed
+            if MODELS.part_synthesis_pipeline is not None:
+                del MODELS.part_synthesis_pipeline
+                MODELS.part_synthesis_pipeline = None
+            if MODELS.bbox_gen_model is not None:
+                del MODELS.bbox_gen_model
+                MODELS.bbox_gen_model = None
+            cleanup_memory()
+            
+        print("OmniPart models loaded successfully.")
         return (True,)
 
 class OmniPartSegmentImage:
@@ -399,8 +419,8 @@ class OmniPartExportObjects:
                 "edge_smoothing": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             }
         }
-    RETURN_TYPES = ("IMAGE", "INT", "STRING")
-    RETURN_NAMES = ("IMAGE_BATCH", "object_count", "output_path")
+    RETURN_TYPES = ("IMAGE", "INT", "STRING", "OMNIPART_POSITION_DATA")
+    RETURN_NAMES = ("IMAGE_BATCH", "object_count", "output_path", "position_data")
     FUNCTION = "export_objects"
     CATEGORY = "OmniPart"
 
@@ -413,6 +433,7 @@ class OmniPartExportObjects:
         source_rgba_np = np.array(source_rgba_pil)
         object_ids = [uid for uid in np.unique(group_ids) if uid >= 0]
         image_batch_list = []
+        position_data_list = []
         count = 0
         for obj_id in object_ids:
             mask = (group_ids == obj_id)
@@ -458,14 +479,27 @@ class OmniPartExportObjects:
             save_path = os.path.join(full_output_path, f"{filename_prefix}_{obj_id}.png")
             final_image_pil.save(save_path)
             image_batch_list.append(pil_to_tensor(final_image_pil.convert("RGB")))
+            
+            # Store position data for this object
+            center_x = (bbox[0] + bbox[2]) / 2
+            center_y = (bbox[1] + bbox[3]) / 2
+            position_data_list.append({
+                "object_id": obj_id,
+                "center_x": center_x,
+                "center_y": center_y,
+                "bbox": bbox,
+                "width": img_width,
+                "height": img_height
+            })
+            
             count += 1
         if not image_batch_list:
             print("Export Objects: No objects found to export.")
             fallback_tensor = torch.zeros((1, 64, 64, 3))
-            return (fallback_tensor, 0, full_output_path)
+            return (fallback_tensor, 0, full_output_path, [])
         final_batch = torch.cat(image_batch_list, dim=0)
         print(f"Exported {count} objects to {full_output_path}")
-        return (final_batch, count, full_output_path)
+        return (final_batch, count, full_output_path, position_data_list)
 
 class OmniPartGenerate3DDataNode:
     @classmethod

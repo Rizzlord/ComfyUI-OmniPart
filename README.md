@@ -3,6 +3,8 @@ This repository contains a set of custom nodes for ComfyUI that implement the Om
 
 The workflow is designed to be interactive and modular, giving you fine-grained control over the segmentation, combination, and generation process. It's an ideal tool for concept artists, game developers, and anyone looking to quickly turn 2D ideas into 3D assets.
 
+This version also includes integration with TripoSG, allowing you to use TripoSG's neural rendering approach for 3D generation instead of OmniPart's native pipeline. A new "Load Texture Pipeline Only" option can be used to save memory when using TripoSG.
+
 (A screenshot of a complete node workflow would be great here!)
 
 Features
@@ -38,6 +40,7 @@ This is the first and most important node. It handles the loading of all the nec
 Inputs:
 
 force_reload: A boolean to force the node to reload all models from disk.
+load_texture_pipeline_only: A boolean to only load the segmentation models (SAM, RMBG) and skip loading the 3D generation models. This is useful when using TripoSG for 3D generation to save memory.
 
 Purpose: You must connect the output of this node to the first node in your processing chain (Segment Image) to ensure the models are ready.
 
@@ -119,6 +122,10 @@ IMAGE_BATCH: A batch of all the exported object images for previewing in ComfyUI
 
 object_count: The number of images successfully exported.
 
+output_path: The directory where the images were saved.
+
+position_data: Positional information for each exported object, used by the TripoSG integration node to properly position 3D models.
+
 6. Generate 3D Data
 This is the core node that processes the final segmentation and generates the 3D representation.
 
@@ -138,6 +145,18 @@ Save Untextured Mesh: Saves the result as a simple, uncolored .glb 3D file.
 Save Textured Mesh: Saves the result as a fully textured .glb file based on the original image colors.
 
 Important: This node is very VRAM-intensive. If you get an "out of memory" error, lower the render_resolution (e.g., to 512) and render_views (e.g., to 50) to reduce the workload.
+
+8. OmniPart TripoSG Integration
+This is an alternative 3D generation node that uses TripoSG instead of OmniPart's native 3D generation pipeline.
+
+Inputs:
+
+omnipart_loader: Connect to the OmniPart Loader node (with "load_texture_pipeline_only" enabled for memory savings)
+image_batch: Connect to the output of "Export Objects from Image" node
+position_data (optional): Connect to the position_data output of "Export Objects from Image" node for proper 3D model positioning
+All other parameters match TripoSG's original parameters
+
+Purpose: Use this node when you want to generate 3D models using TripoSG's neural rendering approach instead of OmniPart's native pipeline. This node will combine all segmented objects into a single mesh, positioned according to their original locations in the image.
 
 Troubleshooting
 CUDA Out of Memory Error: This almost always happens on the Save Textured Mesh node. The texture baking process is extremely demanding. Solution: Lower the render_resolution and render_views values on the node.
