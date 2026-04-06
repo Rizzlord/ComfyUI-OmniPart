@@ -90,7 +90,7 @@ def upscale_pil_image(pil_image, upscale_model):
         print(f"ERROR: Upscale failed: {e}")
         return pil_image
 
-def visualize_mask(image_np, group_ids, visualize=True):
+def visualize_mask(image_np, group_ids, visualize=True, show_numbers=True, background_overlap=1):
     if not visualize:
         max_id = np.max(group_ids)
         if max_id < 0:
@@ -103,24 +103,45 @@ def visualize_mask(image_np, group_ids, visualize=True):
     vis_np = np.ones_like(image_np) * 255
     unique_ids = np.unique(group_ids)
     unique_ids = unique_ids[unique_ids >= 0]
+
+    # Identify largest segment (bottom layer) to fill gaps
+    if len(unique_ids) > 0:
+        areas = [np.sum(group_ids == uid) for uid in unique_ids]
+        largest_idx = np.argmax(areas)
+        largest_id = unique_ids[largest_idx]
+        largest_color = np.array([(largest_idx * 50 + 80) % 256, (largest_idx * 120 + 40) % 256, (largest_idx * 180 + 20) % 256])
+        
+        # Fill all non-background pixels with largest color first to eliminate white lines
+        silhouette_mask = (group_ids != -1).astype(np.uint8)
+        if background_overlap > 0:
+            # Expand background-fill to close gaps
+            silhouette_mask = cv2.dilate(silhouette_mask, np.ones((3, 3), np.uint8), iterations=background_overlap)
+        elif background_overlap < 0:
+            # Shrink background-fill
+            silhouette_mask = cv2.erode(silhouette_mask, np.ones((3, 3), np.uint8), iterations=abs(background_overlap))
+            
+        vis_np[silhouette_mask > 0] = largest_color
+
     for i, unique_id in enumerate(unique_ids):
         color = np.array([(i * 50 + 80) % 256, (i * 120 + 40) % 256, (i * 180 + 20) % 256])
         mask = (group_ids == unique_id)
         vis_np[mask] = color
-    for i, unique_id in enumerate(unique_ids):
-        mask = (group_ids == unique_id)
-        if not np.any(mask):
-            continue
-        dist_map = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
-        _, _, _, max_loc = cv2.minMaxLoc(dist_map)
-        center_x, center_y = max_loc
-        text = str(unique_id)
-        font_face = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.9
-        text_size, _ = cv2.getTextSize(text, font_face, font_scale, 2)
-        text_origin = (center_x - text_size[0] // 2, center_y + text_size[1] // 2)
-        cv2.putText(vis_np, text, text_origin, font_face, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
-        cv2.putText(vis_np, text, text_origin, font_face, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
+
+    if show_numbers:
+        for i, unique_id in enumerate(unique_ids):
+            mask = (group_ids == unique_id)
+            if not np.any(mask):
+                continue
+            dist_map = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
+            _, _, _, max_loc = cv2.minMaxLoc(dist_map)
+            center_x, center_y = max_loc
+            text = str(unique_id)
+            font_face = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.9
+            text_size, _ = cv2.getTextSize(text, font_face, font_scale, 2)
+            text_origin = (center_x - text_size[0] // 2, center_y + text_size[1] // 2)
+            cv2.putText(vis_np, text, text_origin, font_face, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.putText(vis_np, text, text_origin, font_face, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
     return Image.fromarray(vis_np)
 
 def resize_and_fit(pil_image, max_size):
@@ -239,6 +260,8 @@ class OmniPartSegmentImage:
                 "size_threshold": ("INT", {"default": 1800, "min": 100, "max": 8000, "step": 100}),
                 "texture_bleed_radius": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
                 "visualize": ("BOOLEAN", {"default": True}),
+                "show_numbers": ("BOOLEAN", {"default": True}),
+                "background_overlap": ("INT", {"default": 2, "min": -20, "max": 20, "step": 1}),
                 "output_resolution": (['original', '512', '1024', '2048', '4096'],),
             },
             "optional": {
@@ -251,7 +274,7 @@ class OmniPartSegmentImage:
     FUNCTION = "segment_image"
     CATEGORY = "OmniPart"
 
-    def segment_image(self, loader, image, size_threshold, texture_bleed_radius, visualize, output_resolution, enable_upscale=False, upscale_model=None, edge_smoothing=1.0):
+    def segment_image(self, loader, image, size_threshold, texture_bleed_radius, visualize, output_resolution, show_numbers=True, background_overlap=1, enable_upscale=False, upscale_model=None, edge_smoothing=1.0):
         if not all([MODELS.sam_mask_generator, MODELS.rmbg_model]):
             raise Exception("Models not loaded. Please use the OmniPartLoader node first.")
         MODELS.sam_mask_generator.predictor.model.to(DEVICE)
@@ -273,7 +296,7 @@ class OmniPartSegmentImage:
         texture_ready_image.save(rgba_path)
         visual = Visualizer(image_np)
         group_ids, _ = get_sam_mask(image_np, MODELS.sam_mask_generator, visual, None, rgba_image=texture_ready_image, img_name=img_name, save_dir=output_dir, size_threshold=size_threshold)
-        seg_img_pil = visualize_mask(image_np, group_ids, visualize)
+        seg_img_pil = visualize_mask(image_np, group_ids, visualize, show_numbers, background_overlap)
         if enable_upscale:
             seg_img_pil = upscale_pil_image(seg_img_pil, upscale_model)
         resolution_int = 0 if output_resolution == 'original' else int(output_resolution)
@@ -295,6 +318,8 @@ class OmniPartCombineSegments:
                 "omni_state": ("OMNIPART_STATE",),
                 "merge_string": ("STRING", {"multiline": True, "default": "0,1;3,4", "placeholder": "Combine parts, e.g., 0,1; 3,4,5"}),
                 "visualize": ("BOOLEAN", {"default": True}),
+                "show_numbers": ("BOOLEAN", {"default": True}),
+                "background_overlap": ("INT", {"default": 2, "min": -20, "max": 20, "step": 1}),
                 "output_resolution": (['original', '512', '1024', '2048', '4096'],),
             },
             "optional": {
@@ -306,7 +331,7 @@ class OmniPartCombineSegments:
     FUNCTION = "combine_segments"
     CATEGORY = "OmniPart"
 
-    def combine_segments(self, omni_state, merge_string, visualize, output_resolution, enable_upscale=False, upscale_model=None):
+    def combine_segments(self, omni_state, merge_string, visualize, output_resolution, show_numbers=True, background_overlap=1, enable_upscale=False, upscale_model=None):
         if not MODELS.sam_mask_generator:
             raise Exception("Models not loaded. Please use the OmniPartLoader node first.")
         MODELS.sam_mask_generator.predictor.model.to(DEVICE)
@@ -327,7 +352,7 @@ class OmniPartCombineSegments:
         visual = Visualizer(image_np)
         new_group_ids, _ = get_sam_mask(image_np, MODELS.sam_mask_generator, visual, merge_groups=merge_groups, existing_group_ids=group_ids, rgba_image=processed_image, skip_split=True, img_name=img_name, save_dir=output_dir, size_threshold=size_threshold)
         new_group_ids = clean_segment_edges(new_group_ids)
-        merged_img_pil = visualize_mask(image_np, new_group_ids, visualize)
+        merged_img_pil = visualize_mask(image_np, new_group_ids, visualize, show_numbers, background_overlap)
         if enable_upscale:
             merged_img_pil = upscale_pil_image(merged_img_pil, upscale_model)
         resolution_int = 0 if output_resolution == 'original' else int(output_resolution)
@@ -345,6 +370,8 @@ class OmniPartHideSegments:
                 "omni_state": ("OMNIPART_STATE",),
                 "hide_string": ("STRING", {"multiline": False, "default": "", "placeholder": "Segments to hide, e.g., 1,2"}),
                 "visualize": ("BOOLEAN", {"default": True}),
+                "show_numbers": ("BOOLEAN", {"default": True}),
+                "background_overlap": ("INT", {"default": 2, "min": -20, "max": 20, "step": 1}),
                 "output_resolution": (['original', '512', '1024', '2048', '4096'],),
             },
             "optional": {
@@ -359,7 +386,7 @@ class OmniPartHideSegments:
     FUNCTION = "hide_segments"
     CATEGORY = "OmniPart"
 
-    def hide_segments(self, omni_state, hide_string, visualize, output_resolution, enable_upscale=False, upscale_model=None, add_placeholders=False, placeholder_radius=10):
+    def hide_segments(self, omni_state, hide_string, visualize, output_resolution, show_numbers=True, background_overlap=1, enable_upscale=False, upscale_model=None, add_placeholders=False, placeholder_radius=10):
         image_np = omni_state["image_np"]
         group_ids = np.copy(omni_state["group_ids"])
         hide_ids = []
@@ -371,7 +398,7 @@ class OmniPartHideSegments:
         if hide_ids:
             for segment_id in hide_ids:
                 group_ids[group_ids == segment_id] = -1
-        mask_visualization_pil = visualize_mask(image_np, group_ids, visualize)
+        mask_visualization_pil = visualize_mask(image_np, group_ids, visualize, show_numbers, background_overlap)
         source_rgba_pil = Image.open(omni_state["processed_image_path"]).convert("RGBA")
         source_rgba_np = np.array(source_rgba_pil)
         pixels_to_hide = (group_ids == -1)

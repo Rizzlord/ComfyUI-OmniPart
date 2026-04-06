@@ -542,12 +542,6 @@ def get_sam_mask(image, mask_generator, visual, merge_groups=None, existing_grou
             # Adjust transparency based on area size
             adaptive_alpha = min(0.3, max(0.1, 0.1 + area / 100000))
             
-            # Extract edges of this region
-            kernel = np.ones((3, 3), np.uint8)
-            dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
-            eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
-            edge = dilated.astype(bool) & (~eroded.astype(bool))
-            
             # Build label text
             label = f"{unique_id}"
             
@@ -560,14 +554,6 @@ def get_sam_mask(image, mask_generator, visual, merge_groups=None, existing_grou
                 anno_mode=anno_mode,
                 color=color,
                 font_size=20
-            )
-            
-            # Enhance edges (add border effect for all parts)
-            edge_color = [min(c*1.3, 1.0) for c in color]  # Slightly brighter edge color
-            vis_mask = visual.draw_binary_mask(
-                edge,
-                alpha=0.8,  # Lower transparency for edges to make them more visible
-                color=edge_color
             )
             
     im = vis_mask.get_image()
