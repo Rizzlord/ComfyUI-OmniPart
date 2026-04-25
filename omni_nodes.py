@@ -18,7 +18,7 @@ if current_dir not in sys.path:
 
 # Now we can import from the OmniPart modules
 from modules.label_2d_mask.label_parts import (
-    prepare_image, get_sam_mask, clean_segment_edges,
+    prepare_image, get_sam_mask, get_sam3_mask, clean_segment_edges,
     resize_and_pad_to_square
 )
 from modules.label_2d_mask.visualizer import Visualizer
@@ -42,6 +42,7 @@ class OmniPartModels:
     rmbg_model = None
     bbox_gen_model = None
     part_synthesis_pipeline = None
+    sam3_model = None
 
 # Global instance to hold the models
 MODELS = OmniPartModels()
@@ -52,7 +53,8 @@ MODELS = OmniPartModels()
 def tensor_to_pil(tensor):
     if tensor.ndim == 4:
         tensor = tensor.squeeze(0)
-    image_np = tensor.mul(255).clamp(0, 255).byte().cpu().numpy()
+    # Convert to float before operations to ensure BFloat16 compatibility
+    image_np = tensor.float().mul(255).clamp(0, 255).byte().cpu().numpy()
     return Image.fromarray(image_np)
 
 def pil_to_tensor(image):
@@ -250,6 +252,126 @@ class OmniPartLoaderNode:
         print("OmniPart models loaded successfully.")
         return (True,)
 
+class OmniPartLoaderSAM3Node:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "force_reload": ("BOOLEAN", {"default": False}),
+                "model_path": ("STRING", {"default": "models/sam3/sam3.pt"}),
+            }
+        }
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("loaded",)
+    FUNCTION = "load_sam3"
+    CATEGORY = "OmniPart"
+
+    def load_sam3(self, force_reload, model_path):
+        if MODELS.sam3_model is None or force_reload:
+            print(f"Loading SAM3 model from {model_path}...")
+            from modules.sam3.sam3_loader_logic import LoadSAM3Model
+            loader = LoadSAM3Model()
+            MODELS.sam3_model = loader.load_model(model_path)[0]
+        
+        # Ensure RMBG model is also loaded for background removal, matching the original loader's behavior
+        if MODELS.rmbg_model is None or force_reload:
+            print("Loading RMBG model for SAM3 support...")
+            try:
+                MODELS.rmbg_model = AutoModelForImageSegmentation.from_pretrained("briaai/RMBG-2.0", trust_remote_code=True)
+                MODELS.rmbg_model.to(DEVICE)
+            except Exception as e:
+                print(f"Warning: Failed to load RMBG model: {e}")
+            
+        print("OmniPart SAM3 models loaded successfully.")
+        return (True,)
+
+class OmniPartSegmentImageSAM3:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "loader": ("BOOLEAN", {"forceInput": True}),
+                "image": ("IMAGE",),
+                "text_prompt": ("STRING", {"default": "", "multiline": True}),
+                "confidence_threshold": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01}),
+                "size_threshold": ("INT", {"default": 1800, "min": 100, "max": 8000, "step": 100}),
+                "texture_bleed_radius": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
+                "visualize": ("BOOLEAN", {"default": True}),
+                "show_numbers": ("BOOLEAN", {"default": True}),
+                "background_overlap": ("INT", {"default": 2, "min": -20, "max": 20, "step": 1}),
+                "output_resolution": (['original', '512', '1024', '2048', '4096'],),
+            },
+            "optional": {
+                "enable_upscale": ("BOOLEAN", {"default": False}),
+                "upscale_model": ("UPSCALE_MODEL",),
+                "edge_smoothing": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+            }
+        }
+    RETURN_TYPES = ("IMAGE", "OMNIPART_STATE")
+    FUNCTION = "segment_image"
+    CATEGORY = "OmniPart"
+
+    def segment_image(self, loader, image, text_prompt, confidence_threshold, size_threshold, texture_bleed_radius, visualize, show_numbers, background_overlap, output_resolution, enable_upscale=False, upscale_model=None, edge_smoothing=1.0):
+        if not MODELS.sam3_model:
+             raise Exception("SAM3 Model not loaded. Please use the 'Load OmniPart SAM3 Model' node first.")
+        if not MODELS.rmbg_model:
+            raise Exception("RMBG Model not loaded. Please ensure you have run a loader node (either SAM3 Loader or original OmniPart Loader).")
+        
+        # Load to GPU via ComfyUI model management
+        mm.load_models_gpu([MODELS.sam3_model])
+        MODELS.sam3_model.processor.confidence_threshold = confidence_threshold
+        MODELS.rmbg_model.to(DEVICE)
+        
+        pil_image = tensor_to_pil(image)
+        output_dir = folder_paths.get_temp_directory()
+        img_name = f"omni_input_sam3_{np.random.randint(100000)}"
+        
+        processed_image = prepare_image(pil_image, rmbg_net=MODELS.rmbg_model)
+        processed_image = resize_and_pad_to_square(processed_image)
+        processed_image = smooth_edges(processed_image, edge_smoothing)
+        
+        texture_ready_image = create_texture_bleed_image(processed_image, texture_bleed_radius)
+        
+        white_bg = Image.new("RGBA", texture_ready_image.size, (255, 255, 255, 255))
+        white_bg_img = Image.alpha_composite(white_bg, texture_ready_image.convert("RGBA"))
+        image_np = np.array(white_bg_img.convert('RGB'))
+        rgba_path = os.path.join(output_dir, f"{img_name}_processed.png")
+        texture_ready_image.save(rgba_path)
+        
+        visual = Visualizer(image_np)
+        
+        # Use SAM3 for segmentation
+        group_ids, _ = get_sam3_mask(
+            image_np, 
+            MODELS.sam3_model.processor, 
+            visual, 
+            text_prompt=text_prompt,
+            rgba_image=texture_ready_image, 
+            img_name=img_name, 
+            confidence_threshold=confidence_threshold
+        )
+        
+        seg_img_pil = visualize_mask(image_np, group_ids, visualize, show_numbers, background_overlap)
+        
+        if enable_upscale:
+            seg_img_pil = upscale_pil_image(seg_img_pil, upscale_model)
+            
+        resolution_int = 0 if output_resolution == 'original' else int(output_resolution)
+        if resolution_int > 0:
+             seg_img_pil = seg_img_pil.resize((resolution_int, resolution_int), Image.Resampling.LANCZOS)
+             
+        omni_state = {
+            "image_np": image_np, "processed_image_path": rgba_path, "group_ids": group_ids,
+            "original_group_ids": np.copy(group_ids), "img_name": img_name, "output_dir": output_dir,
+            "size_threshold": size_threshold
+        }
+        
+        # Cleanup
+        # mm.load_models_gpu will handle sam3_model offloading if needed by other nodes
+        cleanup_memory(MODELS.rmbg_model)
+        
+        return (pil_to_tensor(seg_img_pil), omni_state)
+
 class OmniPartSegmentImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -277,7 +399,8 @@ class OmniPartSegmentImage:
     def segment_image(self, loader, image, size_threshold, texture_bleed_radius, visualize, output_resolution, show_numbers=True, background_overlap=1, enable_upscale=False, upscale_model=None, edge_smoothing=1.0):
         if not all([MODELS.sam_mask_generator, MODELS.rmbg_model]):
             raise Exception("Models not loaded. Please use the OmniPartLoader node first.")
-        MODELS.sam_mask_generator.predictor.model.to(DEVICE)
+        # Force SAM to float32 to avoid BFloat16 errors in AMG
+        MODELS.sam_mask_generator.predictor.model.to(DEVICE).float()
         MODELS.rmbg_model.to(DEVICE)
         pil_image = tensor_to_pil(image)
         output_dir = folder_paths.get_temp_directory()
@@ -619,7 +742,9 @@ class OmniPartSaveMeshNode:
 # --- Node Mappings ---
 NODE_CLASS_MAPPINGS = {
     "OmniPartLoader": OmniPartLoaderNode,
+    "OmniPartLoaderSAM3": OmniPartLoaderSAM3Node,
     "OmniPartSegmentImage": OmniPartSegmentImage,
+    "OmniPartSegmentImageSAM3": OmniPartSegmentImageSAM3,
     "OmniPartCombineSegments": OmniPartCombineSegments,
     "OmniPartHideSegments": OmniPartHideSegments,
     "OmniPartExportObjects": OmniPartExportObjects,
@@ -629,7 +754,9 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniPartLoader": "Load OmniPart Models",
+    "OmniPartLoaderSAM3": "Load OmniPart SAM3 Model",
     "OmniPartSegmentImage": "Segment Image",
+    "OmniPartSegmentImageSAM3": "Segment Image SAM3",
     "OmniPartCombineSegments": "Combine Segments",
     "OmniPartHideSegments": "Hide Segments",
     "OmniPartExportObjects": "Export Objects from Image",

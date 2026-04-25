@@ -27,6 +27,12 @@ from torchvision import transforms
 import torch.nn.functional as F_nn
 from segment_anything import SamAutomaticMaskGenerator, build_sam
 from modules.label_2d_mask.visualizer import Visualizer
+# SAM3 Imports
+try:
+    from modules.sam3.sam3_lib.model.sam3_image_processor import Sam3Processor
+    SAM3_AVAILABLE = True
+except ImportError:
+    SAM3_AVAILABLE = False
 
 # Minimum size threshold for considering a segment (in pixels)
 size_th = 2000
@@ -117,7 +123,8 @@ def prepare_image(image, bg_color=None, rmbg_net=None):
     with torch.no_grad():
         preds = rmbg_net(input_images)[-1].sigmoid().cpu()
     pred = preds[0].squeeze()
-    pred_pil = transforms.ToPILImage()(pred)
+    # Convert to float to avoid "Got unsupported ScalarType BFloat16" in transforms.ToPILImage
+    pred_pil = transforms.ToPILImage()(pred.float())
     mask = pred_pil.resize(image.size)
     image.putalpha(mask)
 
@@ -558,4 +565,144 @@ def get_sam_mask(image, mask_generator, visual, merge_groups=None, existing_grou
             
     im = vis_mask.get_image()
     
+    return group_ids, im
+
+def get_sam3_mask(image, processor, visual, text_prompt=None, merge_groups=None, existing_group_ids=None, 
+                 check_undetected=True, rgba_image=None, img_name=None, skip_split=False, save_dir=None, size_threshold=None, confidence_threshold=0.1):
+    """
+    Generate and process SAM3 masks for the image using grounding.
+    """
+    if size_threshold is None:
+        size_threshold = 2000 # Default
+    
+    label_mode = '1'
+    anno_mode = ['Mask', 'Mark']
+    
+    # SAM3 logic
+    if existing_group_ids is not None:
+        group_ids = existing_group_ids.copy()
+    else:
+        # Convert image to PIL for SAM3 Processor
+        pil_image = Image.fromarray(image)
+        
+        # Processor state
+        state = processor.set_image(pil_image)
+        
+        # Use provided prompt or default to 'object' for automatic discovery
+        prompt = text_prompt.strip() if (text_prompt and text_prompt.strip()) else "object"
+        print(f"[SAM3] Using prompt: {prompt} (Confidence: {confidence_threshold})")
+        
+        # Ensure processor threshold matches
+        processor.confidence_threshold = confidence_threshold
+        state = processor.set_text_prompt(prompt, state)
+        
+        masks = state.get("masks", None)
+        scores = state.get("scores", None)
+        
+        if masks is None or len(masks) == 0:
+            print("[SAM3] No parts detected with prompt.")
+            group_ids = np.full((image.shape[0], image.shape[1]), -1, dtype=int)
+        else:
+            print(f"[SAM3] Detected {len(masks)} parts.")
+            # Ensure masks is a tensor and handle possible BFloat16
+            if hasattr(masks, 'float'):
+                masks = masks.float()
+            
+            # Convert to CPU numpy for processing
+            masks_np = masks.cpu().numpy()
+            
+            # Ensure 3D shape: [N, H, W]
+            if masks_np.ndim == 2:
+                masks_np = masks_np[np.newaxis, ...]
+            elif masks_np.ndim == 4:
+                masks_np = np.squeeze(masks_np, axis=1) if masks_np.shape[1] == 1 else np.squeeze(masks_np, axis=0)
+            
+            # Second check to ensure we are 3D after squeeze/unsqueeze
+            if masks_np.ndim != 3:
+                print(f"[SAM3] Warning: Unexpected masks shape {masks_np.shape}, attempting to force 3D")
+                masks_np = masks_np.reshape(-1, masks_np.shape[-2], masks_np.shape[-1])
+
+            h, w = masks_np.shape[1], masks_np.shape[2]
+            group_ids = np.full((h, w), -1, dtype=int)
+            
+            # Calculate areas for each mask
+            areas = np.sum(masks_np, axis=(1, 2))
+            
+            # Sort by area descending
+            indices = np.argsort(areas)[::-1]
+            
+            print(f"[SAM3] Processing {len(indices)} masks after shape normalization. Shape: {masks_np.shape}")
+            
+            group_counter = 0
+            for i in indices:
+                # Extra safety check for index limits
+                if i >= masks_np.shape[0]:
+                    print(f"[SAM3] Skipping out of bounds index {i} for masks size {masks_np.shape[0]}")
+                    continue
+                    
+                mask = masks_np[i]
+                mask_bool = mask > 0.5
+                area = np.sum(mask_bool) # Recalculate area for boolean mask
+                
+                if area < size_threshold:
+                    continue
+                
+                # Check background ratio if RGBA provided (using same logic as get_sam_mask)
+                if rgba_image is not None:
+                    rgba_array = np.array(rgba_image)
+                    if rgba_array.shape[2] == 4:
+                        background_mask = rgba_array[:, :, 3] <= 10
+                        background_pixels_in_mask = np.sum(mask_bool & background_mask)
+                        background_ratio = background_pixels_in_mask / area
+                        if background_ratio > 0.1:
+                            continue
+
+                group_ids[mask_bool] = group_counter
+                group_counter += 1
+            
+            # Split disconnected parts
+            group_ids = split_disconnected_parts(group_ids, size_threshold)
+        
+    # Merge groups if specified (consistent with SAM2 logic)
+    if merge_groups is not None:
+        merged_group_ids = group_ids
+        for new_id, group in enumerate(merge_groups):
+            group_mask = np.zeros_like(group_ids, dtype=bool)
+            orig_ids_first = group[0]
+            for orig_id in group:
+                mask = (group_ids == orig_id)
+                if np.sum(mask) > 0:
+                    group_mask = group_mask | mask
+            if np.any(group_mask):
+                merged_group_ids[group_mask] = orig_ids_first
+        
+        unique_ids = np.unique(merged_group_ids)
+        unique_ids = unique_ids[unique_ids != -1]
+        id_reassignment = {old_id: new_id for new_id, old_id in enumerate(unique_ids)}
+        new_group_ids = np.full_like(merged_group_ids, -1)
+        for old_id, new_id in id_reassignment.items():
+            new_group_ids[merged_group_ids == old_id] = new_id
+        group_ids = new_group_ids
+        if not skip_split:
+            group_ids = split_disconnected_parts(group_ids, size_threshold)
+    
+    # Create visualization
+    vis_mask = visual
+    background_mask = (group_ids == -1)
+    if np.any(background_mask):
+        vis_mask = visual.draw_binary_mask(background_mask, color=[1.0, 1.0, 1.0], alpha=0.0)
+
+    for unique_id in np.unique(group_ids):
+        if unique_id == -1: continue
+        mask = (group_ids == unique_id)
+        y_indices, x_indices = np.where(mask)
+        if len(y_indices) > 0 and len(x_indices) > 0:
+            area = len(y_indices)
+            if area < 30: continue
+            color = [(unique_id * 50 + 80) % 200 / 255.0 + 0.2, (unique_id * 120 + 40) % 200 / 255.0 + 0.2, (unique_id * 180 + 20) % 200 / 255.0 + 0.2]
+            adaptive_alpha = min(0.3, max(0.1, 0.1 + area / 100000))
+            label = f"{unique_id}"
+            vis_mask = visual.draw_binary_mask_with_number(mask, text=label, label_mode=label_mode, alpha=adaptive_alpha, anno_mode=anno_mode, color=color, font_size=20)
+            
+    im = vis_mask.get_image()
     return group_ids, im

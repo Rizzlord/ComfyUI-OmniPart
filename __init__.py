@@ -7,6 +7,8 @@ from .omni_nodes import (
     OmniPartGenerate3DDataNode,
     OmniPartSaveMeshNode,
     OmniPartExportObjects,
+    OmniPartLoaderSAM3Node,
+    OmniPartSegmentImageSAM3,
 )
 
 from .omni_texture import OmniPartSaveTexturedMesh
@@ -21,6 +23,8 @@ NODE_CLASS_MAPPINGS = {
     "OmniPartSaveMesh": OmniPartSaveMeshNode,
     "OmniPartSaveTexturedMesh": OmniPartSaveTexturedMesh,
     "OmniPartExportObjects": OmniPartExportObjects,
+    "OmniPartLoaderSAM3": OmniPartLoaderSAM3Node,
+    "OmniPartSegmentImageSAM3": OmniPartSegmentImageSAM3,
 }
 
 # Map the internal class names to the names that will be displayed in the menu
@@ -33,6 +37,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniPartSaveMesh": "Save Untextured Mesh",
     "OmniPartSaveTexturedMesh": "Save Textured Mesh",
     "OmniPartExportObjects": "Export Objects from Image",
+    "OmniPartLoaderSAM3": "Load OmniPart SAM3 Model",
+    "OmniPartSegmentImageSAM3": "Segment Image SAM3",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
